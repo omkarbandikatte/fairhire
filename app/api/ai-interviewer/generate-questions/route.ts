@@ -1,50 +1,105 @@
 import { type NextRequest, NextResponse } from "next/server"
 import { GoogleGenerativeAI } from "@google/generative-ai"
 
-export async function POST(request: NextRequest) {
+/**
+ * Utility — validate Google API keys.
+ * Pattern: starts with "AIza" and is exactly 39 chars long.
+ */
+const GOOGLE_KEY_REGEX = /^AIza[0-9A-Za-z\-_]{35}$/
+
+/* -------------------------------------------------------------------------- */
+/*                     Route Handler – POST /generate-questions               */
+/* -------------------------------------------------------------------------- */
+export async function POST(req: NextRequest) {
+  const {
+    resumeData,
+    position,
+    difficulty = "medium",
+    questionCount = 5,
+    geminiApiKey, // optional override – useful in dev / self-hosted
+  } = await req.json()
+
+  /* ------------------------------ validation ------------------------------ */
+  if (!position || typeof position !== "string") {
+    return NextResponse.json({ error: "Position is required." }, { status: 400 })
+  }
+
+  /* --------------------------- pick + sanitise key ------------------------ */
+  const rawKey = (geminiApiKey ?? process.env.GEMINI_API_KEY ?? "").trim()
+  const hasValidKey = GOOGLE_KEY_REGEX.test(rawKey)
+
+  /* ------------------- helper: always return fallback --------------------- */
+  const fallback = (reason: string) =>
+    NextResponse.json(
+      {
+        questions: generateFallbackQuestions(position, questionCount),
+        message: `Fallback questions supplied – ${reason}`,
+      },
+      { status: 200 },
+    )
+
+  /* ------------ if key missing or malformed → fallback early ------------- */
+  if (!hasValidKey) {
+    return fallback("GEMINI_API_KEY is missing or invalid.")
+  }
+
+  /* ----------------------------- Gemini call ----------------------------- */
   try {
-    const { resumeData, position, difficulty = "medium", questionCount = 5 } = await request.json()
+    const genAI = new GoogleGenerativeAI(rawKey)
+    const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" })
 
-    if (!position) {
-      return NextResponse.json({ error: "Position is required" }, { status: 400 })
-    }
+    const prompt = buildPrompt({ position, difficulty, questionCount, resumeData })
 
-    const apiKey = process.env.GEMINI_API_KEY
+    const result = await model.generateContent(prompt)
+    const rawText = (await result.response).text()
 
-    // Check if API key is properly configured
-    if (!apiKey || apiKey === "your_gemini_api_key_here" || apiKey.length < 10) {
-      console.log("Gemini API key not configured, using fallback questions")
-      const fallbackQuestions = generateFallbackQuestions(position, difficulty, questionCount)
-      return NextResponse.json({
-        questions: fallbackQuestions,
-        message: "Using fallback questions - configure Gemini API key for AI-generated questions",
-      })
-    }
+    const questions = parseQuestions(rawText, questionCount)
 
-    try {
-      const genAI = new GoogleGenerativeAI(apiKey)
-      const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" })
+    return NextResponse.json({ questions, message: "Questions generated with Google Gemini." }, { status: 200 })
+  } catch (err: any) {
+    /* ---------- handle invalid-key or any other Gemini failure ----------- */
+    const errMsg: string = err?.message ?? ""
+    const isKeyRejected = errMsg.includes("API_KEY_INVALID") || errMsg.includes("API Key not found")
 
-      const prompt = `
-Generate ${questionCount} interview questions for a ${position} position with ${difficulty} difficulty.
+    console.error("Gemini generation error:", errMsg) // still log for observability
 
-${
-  resumeData
-    ? `
-Candidate Background:
-- Experience: ${resumeData.experience?.map((exp: any) => `${exp.position} at ${exp.company}`).join(", ") || "Not provided"}
-- Skills: ${resumeData.skills?.join(", ") || "Not provided"}
-`
-    : ""
+    return fallback(
+      isKeyRejected ? "GEMINI_API_KEY was rejected by Google." : "Gemini service failed; see server logs.",
+    )
+  }
 }
 
-Difficulty: ${difficulty} (easy=entry level, medium=mid level, hard=senior level)
+/* -------------------------------------------------------------------------- */
+/*                              Helper functions                              */
+/* -------------------------------------------------------------------------- */
 
-Return ONLY a JSON array with this structure:
+/** Compose the prompt sent to Gemini */
+function buildPrompt(opts: {
+  position: string
+  difficulty: string
+  questionCount: number
+  resumeData?: any
+}) {
+  const { position, difficulty, questionCount, resumeData } = opts
+
+  const background = resumeData
+    ? `
+Candidate Background:
+- Experience: ${resumeData.experience?.map((e: any) => `${e.position} at ${e.company}`).join(", ") || "Not provided"}
+- Skills: ${resumeData.skills?.join(", ") || "Not provided"}`
+    : ""
+
+  return `
+Generate ${questionCount} interview questions for a ${position} position with ${difficulty} difficulty.
+${background}
+
+Difficulty: ${difficulty} (easy=entry, medium=mid, hard=senior)
+
+Return ONLY a JSON array with this shape:
 [
   {
     "id": "1",
-    "question": "Question text here",
+    "question": "Question text",
     "type": "technical",
     "expectedDuration": 120,
     "followUp": "Follow-up question",
@@ -52,74 +107,43 @@ Return ONLY a JSON array with this structure:
   }
 ]
 
-Question types: technical (60%), behavioral (25%), situational (15%)
-Make questions fair, unbiased, and relevant to ${position}.
-`
-
-      const result = await model.generateContent(prompt)
-      const response = await result.response
-      const text = response.text()
-
-      try {
-        // Clean and extract JSON
-        const cleanedText = text.replace(/```json\n?|\n?```/g, "").trim()
-        const jsonMatch = cleanedText.match(/\[[\s\S]*\]/)
-
-        if (!jsonMatch) {
-          throw new Error("No valid JSON array found")
-        }
-
-        const questions = JSON.parse(jsonMatch[0])
-
-        if (!Array.isArray(questions) || questions.length === 0) {
-          throw new Error("Invalid questions format")
-        }
-
-        // Validate and clean questions
-        const validatedQuestions = questions.slice(0, questionCount).map((q, index) => ({
-          id: q.id || (index + 1).toString(),
-          question: q.question || `Sample question for ${position}`,
-          type: q.type || "technical",
-          expectedDuration: q.expectedDuration || 120,
-          followUp: q.followUp || "Can you elaborate on that?",
-          hints: Array.isArray(q.hints) ? q.hints : ["Think about your experience", "Consider best practices"],
-        }))
-
-        return NextResponse.json({
-          questions: validatedQuestions,
-          message: "Questions generated by AI",
-        })
-      } catch (parseError) {
-        console.error("Error parsing AI response:", parseError)
-        throw parseError
-      }
-    } catch (aiError) {
-      console.error("AI generation error:", aiError)
-      throw aiError
-    }
-  } catch (error) {
-    console.error("Error generating questions:", error)
-
-    // Always provide fallback questions
-    const fallbackQuestions = generateFallbackQuestions(position, difficulty, questionCount)
-    return NextResponse.json({
-      questions: fallbackQuestions,
-      message: "Using fallback questions due to AI error",
-    })
-  }
+Question mix: technical 60%, behavioral 25%, situational 15%.
+Ensure questions are fair, unbiased, and relevant to ${position}.`.trim()
 }
 
-function generateFallbackQuestions(position: string, difficulty: string, questionCount: number) {
-  const positionName = position.replace("-", " ")
+/** Extract & normalise the JSON array returned by Gemini */
+function parseQuestions(raw: string, limit: number) {
+  const cleaned = raw.replace(/```json\s*|```/g, "").trim()
+  const match = cleaned.match(/\[[\s\S]*\]/)
 
-  const questions = [
+  if (!match) throw new Error("No JSON array found in Gemini response")
+
+  const parsed = JSON.parse(match[0])
+  if (!Array.isArray(parsed) || parsed.length === 0) {
+    throw new Error("Invalid questions array")
+  }
+
+  return parsed.slice(0, limit).map((q, idx) => ({
+    id: q.id ?? String(idx + 1),
+    question: q.question ?? "Sample question",
+    type: q.type ?? "technical",
+    expectedDuration: q.expectedDuration ?? 120,
+    followUp: q.followUp ?? "Can you elaborate?",
+    hints: Array.isArray(q.hints) ? q.hints : ["Reflect on your experience", "Consider best practices"],
+  }))
+}
+
+/** Local fallback question set – always at least `count` long */
+function generateFallbackQuestions(position: string, count: number) {
+  const readable = position.replace(/-/g, " ")
+  const base = [
     {
       id: "1",
-      question: `Tell me about your experience with ${positionName} and what interests you about this role.`,
+      question: `Tell me about your experience with ${readable}.`,
       type: "behavioral",
       expectedDuration: 120,
-      followUp: "What specific aspects do you find most challenging?",
-      hints: ["Focus on relevant experience", "Mention specific technologies"],
+      followUp: "What aspects did you find most challenging?",
+      hints: ["Focus on relevant experience", "Mention key technologies"],
     },
     {
       id: "2",
@@ -127,33 +151,34 @@ function generateFallbackQuestions(position: string, difficulty: string, questio
       type: "situational",
       expectedDuration: 180,
       followUp: "What would you do differently next time?",
-      hints: ["Use the STAR method", "Focus on your contributions", "Highlight problem-solving"],
+      hints: ["Use the STAR method", "Highlight problem-solving"],
     },
     {
       id: "3",
       question: "How do you stay updated with the latest technologies and industry trends?",
       type: "behavioral",
       expectedDuration: 90,
-      followUp: "Can you give an example of something new you learned recently?",
-      hints: ["Mention specific resources", "Show continuous learning", "Demonstrate passion"],
+      followUp: "Give an example of something new you learned recently.",
+      hints: ["Mention specific resources", "Show continuous learning"],
     },
     {
       id: "4",
-      question: `What do you think are the most important skills for a ${positionName}?`,
+      question: `What do you think are the most important skills for a ${readable}?`,
       type: "technical",
       expectedDuration: 120,
       followUp: "How do you demonstrate these skills in your work?",
-      hints: ["Think about both technical and soft skills", "Relate to the job requirements"],
+      hints: ["Include both technical & soft skills"],
     },
     {
       id: "5",
-      question: "Describe a time when you had to work with a difficult team member or stakeholder.",
+      question: "Describe a time you had to work with a difficult team member or stakeholder.",
       type: "behavioral",
       expectedDuration: 150,
       followUp: "What did you learn from that experience?",
-      hints: ["Focus on communication", "Show emotional intelligence", "Highlight resolution"],
+      hints: ["Focus on communication", "Show emotional intelligence"],
     },
   ]
 
-  return questions.slice(0, questionCount)
+  /* ensure we never return more than we have */
+  return base.slice(0, count)
 }
