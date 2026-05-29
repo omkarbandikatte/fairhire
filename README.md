@@ -46,6 +46,27 @@ FairHire is a Next.js (App Router) web app that helps candidates practice interv
 - `actions/` — Server actions for interview CRUD (e.g., `actions/interview-actions.ts`)
 - `lib/` — Types and core helpers (e.g., `lib/types.ts` defines `Interview`, `Resume`, etc.)
 
+## System Architecture Diagram
+
+```mermaid
+flowchart LR
+  U[Candidate / Interviewer] --> W[Next.js Web App UI<br/>App Router + React]
+  W --> A[Auth Context + Protected Routes]
+  A --> FA[Firebase Auth]
+
+  W --> SA[Server Actions<br/>actions/*]
+  W --> API[API Routes<br/>app/api/*]
+
+  SA --> DB[(Firestore<br/>interviews/users)]
+  API --> DB
+
+  API --> G[Google Gemini API<br/>questions, resume, bias, sentiment]
+  API --> O[OpenAI API<br/>summary generation]
+
+  API --> W
+  DB --> W
+```
+
 ## Getting Started (Local Development)
 
 ### 1) Install dependencies
